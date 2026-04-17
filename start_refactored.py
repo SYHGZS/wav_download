@@ -947,17 +947,40 @@ class DetectionSystem:
                     label = names[int(cls_idx)]
                     print(f"{int(cls_idx)}-{label}: {conf:.2f}")
 
+    def _query_seconds_to_next_rule(self) -> int:
+        """查询距离下一条规则到期还有多少秒，供主循环动态调整 sleep，避免频繁无效轮次"""
+        try:
+            conn = self.pool.connection()
+            cs = conn.cursor()
+            cs.execute(
+                "SELECT TIMESTAMPDIFF(SECOND, NOW(), MIN(c.last_execution_time)) "
+                "FROM pgy_server.work_iot_warn_rule r "
+                "INNER JOIN pgy_server.work_ai_model_config c ON c.id = r.ai_mode_config_id "
+                "WHERE r.enabled = 1 AND c.last_execution_time IS NOT NULL AND c.last_execution_time > NOW()"
+            )
+            row = cs.fetchone()
+            cs.close()
+            conn.close()
+            if row and row[0] is not None:
+                return max(0, int(row[0]))
+        except Exception:
+            pass
+        return 0
+
     def update_last_update_time(self, rule):
         conn = self.pool.connection()
         cs = conn.cursor()
-        rule_id = rule["id"]
-        sql = f"UPDATE pgy_server.work_ai_model_config SET last_execution_time = DATE_ADD(NOW(), INTERVAL cycle SECOND) WHERE id = {rule_id}"
-        cs.execute(sql)
+        # 优先用 DB 查出的 config_id（work_ai_model_config.id），回退到 rule["id"]
+        config_id = rule.get("config_id", rule["id"])
+        sql = "UPDATE pgy_server.work_ai_model_config SET last_execution_time = DATE_ADD(NOW(), INTERVAL cycle SECOND) WHERE id = %s"
+        cs.execute(sql, (config_id,))
         conn.commit()
-        return conn, cs
+        cs.close()
+        conn.close()
 
-    def run(self):
-        """主运行函数 - 使用重构后的方法，循环逐个处理规则，以下的规则需要在数据库的work_ai_model_config表中"""
+    def run(self) -> int:
+        """主运行函数 - 循环逐个处理规则
+        返回值：建议的下次等待秒数（0 表示交由主循环的时段间隔决定）"""
         t_run_start = time.time()
         print(f"\n[{_ts()}] [RUN START] {'=' * 50}")
         print(f"[{_ts()}] [RUN START] 新一轮检测任务开始")
@@ -984,42 +1007,47 @@ class DetectionSystem:
             if len(data) > 0:
                 rule_ids.append(rule["id"])
         print(f"[{_ts()}] [DB] 摄像头已配置的规则 ID: {rule_ids} (共 {len(rule_ids)} 条)")
-        # 查询需要执行的规则
-        # sql = "SELECT r.id,c.threshold_min FROM work_iot_warn_rule r INNER JOIN work_ai_model_config c on c.id=r.ai_mode_config_id WHERE r.enabled = 1 AND (c.last_execution_time IS NULL OR NOW() >= DATE_ADD(c.last_execution_time, INTERVAL c.cycle SECOND))"
-        # if len(rule_ids) > 0:
-        #     sql += f" AND r.id IN ({','.join([str(id) for id in rule_ids])})"
+        # 查询需要执行的规则（r.id=规则ID, c.threshold_min=置信度, c.id=模型配置ID）
+        sql = "SELECT r.id, c.threshold_min, c.id FROM work_iot_warn_rule r INNER JOIN work_ai_model_config c on c.id=r.ai_mode_config_id WHERE r.enabled = 1 AND (c.last_execution_time IS NULL OR NOW() >= DATE_ADD(c.last_execution_time, INTERVAL c.cycle SECOND))"
+        if len(rule_ids) > 0:
+            sql += f" AND r.id IN ({','.join([str(id) for id in rule_ids])})"
         conn = self.pool.connection()
         cs = conn.cursor()
-        # cs.execute(sql)
-        # data = cs.fetchall()
-        # if not data or len(data) == 0:
-        #     print(f"[{_ts()}] [WARN] 无待执行规则，跳过此轮检测")
-        #     time.sleep(10)
-        #     return
-        # print(f"[{_ts()}] [DB] 查询到 {len(data)} 条待执行规则: {[d[0] for d in data]}")
+        cs.execute(sql)
+        data = cs.fetchall()
+        if not data or len(data) == 0:
+            secs = self._query_seconds_to_next_rule()
+            print(f"[{_ts()}] [SKIP] 当前无待执行规则，下次检查约 {secs}s 后")
+            return secs
+        print(f"[{_ts()}] [DB] 查询到 {len(data)} 条待执行规则: {[d[0] for d in data]}")
         # 直接调用重构后的方法，不使用线程
         self.capture_frames_from_cameras()
         # 截完图之后再次查询一遍，确保数据是最新的
 
-        # cs = conn.cursor()
-        # cs.execute(sql)
-        # data = cs.fetchall()
-        # if not data or len(data) == 0:
-        #     print(f"[{_ts()}] [WARN] 截图完成后规则已全部过期，跳过此轮")
-        #     return
-        # rule_id_map = {d[0]: d[1] for d in data}
+        cs = conn.cursor()
+        cs.execute(sql)
+        data = cs.fetchall()
+        if not data or len(data) == 0:
+            secs = self._query_seconds_to_next_rule()
+            print(f"[{_ts()}] [SKIP] 截图后规则已全部过期，下次检查约 {secs}s 后")
+            cs.close()
+            conn.close()
+            return secs
+        # d[0]=r.id, d[1]=c.threshold_min(置信度), d[2]=c.id(模型配置ID)
+        rule_id_map = {d[0]: {"conf": d[1], "config_id": d[2]} for d in data}
 
         # 循环逐个处理规则
         processed_count = 0
-        rule_id_map = {d["id"]: d["conf"] for d in rule_list}
         for rule in rule_list:
-            if rule["id"] not in rule_id_map.keys():
-                print(f"[{_ts()}] [SKIP] 规则 '{rule['label']}' (ID={rule['id']}) 无需执行，跳过")
-                self.update_last_update_time(rule)
+            if rule["id"] not in rule_id_map:
+                print(f"[{_ts()}] [SKIP] 规则 '{rule['label']}' (ID={rule['id']}) 未到执行周期，跳过")
                 continue
             t_rule_start = time.time()
-            conf_value = float(rule_id_map[rule["id"]])
+            entry = rule_id_map[rule["id"]]
+            # DB 有值则用 DB 的置信度，否则回退到硬编码默认值
+            conf_value = float(entry["conf"]) if entry["conf"] is not None else rule["conf"]
             rule["conf"] = conf_value
+            rule["config_id"] = entry["config_id"]
             print(
                 f"[{_ts()}] [RULE START] 开始处理规则: '{rule['label']}' (ID={rule['id']}, model={rule['model']}, conf={conf_value})"
             )
@@ -1027,7 +1055,7 @@ class DetectionSystem:
             elapsed = time.time() - t_rule_start
             print(f"[{_ts()}] [RULE DONE] 规则 '{rule['label']}' 处理完成，耗时 {elapsed:.2f}s")
             processed_count += 1
-            conn, cs = self.update_last_update_time(rule)
+            self.update_last_update_time(rule)
         self.captured_frames.clear()  # 清空已处理的数据
         cs.close()
         conn.close()
@@ -1044,13 +1072,14 @@ def main(environment=None):
 
 if __name__ == "__main__":
     # 1. 在循环外初始化：确保 10 几个模型和数据库连接池只加载 1 次！
-    detection_system = DetectionSystem("prod")
+    detection_system = DetectionSystem("test")
 
     # 2. 只有检测逻辑在无限循环中运行
     while True:
         t_start = time.time()
+        suggested_sleep = 0
         try:
-            detection_system.run()
+            suggested_sleep = detection_system.run() or 0
         except Exception as e:
             # 加上全局异常捕获，防止因为偶尔的网络抖动导致整个脚本崩溃退出
             print(
@@ -1058,10 +1087,12 @@ if __name__ == "__main__":
             )
         interval = get_detection_interval()
         elapsed = time.time() - t_start
-        sleep_secs = max(0.0, interval - elapsed)
+        # 取"时段间隔"和"DB建议等待"中的较大值，避免规则未到期时的无效轮次
+        effective_interval = max(interval, suggested_sleep)
+        sleep_secs = max(0.0, effective_interval - elapsed)
         next_run = time.strftime("%H:%M:%S", time.localtime(time.time() + sleep_secs))
         print(
-            f"[{_ts()}] [SCHEDULER] 当前间隔={interval // 60}分钟 | 本轮耗时={elapsed:.1f}s | "
+            f"[{_ts()}] [SCHEDULER] 间隔={effective_interval // 60}分钟 | 本轮耗时={elapsed:.1f}s | "
             f"等待={sleep_secs:.1f}s | 下次执行时间={next_run}"
         )
         time.sleep(sleep_secs)
