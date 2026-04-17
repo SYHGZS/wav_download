@@ -10,6 +10,7 @@ import random
 import time
 
 import cv2
+import numpy as np
 import pymysql
 import requests
 import torch
@@ -25,10 +26,61 @@ def _ts():
     return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
 
 
+def get_detection_interval() -> int:
+    """
+    根据当前时段返回检测间隔（秒）：
+      高峰时段（11:00–14:00 / 17:00–20:00）：每 2 分钟
+      其他时段：每 10 分钟
+    """
+    hour = time.localtime().tm_hour
+    if 11 <= hour < 14 or 17 <= hour < 20:
+        return 120  # 2 分钟
+    return 600  # 10 分钟
+
+
+def is_invalid_frame(frame, std_threshold=15.0, black_ratio_threshold=0.80, check_size=(320, 240)):
+    """
+    判断截图是否为无效帧（全灰、全黑、摄像头离线等）。
+    - 条件1：灰度图像素标准差极低 → 全灰/纯色帧（摄像头离线/信号中断）
+    - 条件2：近黑像素占比超过阈值 → 全黑帧（遮挡/断电），与 shelter.py 逻辑一致
+    任一条件满足即判定为无效帧，返回 (True, 原因说明)；否则返回 (False, None)。
+    """
+    # 1. 防御性检查：确保 frame 是有效的 NumPy 数组且具有完整的三通道
+    if not isinstance(frame, np.ndarray):
+        return True, "Invalid type: frame is not numpy array"
+
+    if frame.size == 0 or len(frame.shape) != 3 or frame.shape[2] != 3:
+        return True, f"Invalid shape: {frame.shape}"
+
+    height, width = frame.shape[:2]
+    if height == 0 or width == 0:
+        return True, "Invalid dimensions: width or height is 0"
+
+    # 2. 性能优化：缩小图像后再进行统计计算
+    # 缩小图像能保留宏观的颜色分布，同时极大降低 CPU 计算开销
+    small_frame = cv2.resize(frame, check_size, interpolation=cv2.INTER_NEAREST)
+
+    # 3. 标准差检测（纯色帧/离线帧）
+    gray = cv2.cvtColor(small_frame, cv2.COLOR_BGR2GRAY)
+    std_dev = float(np.std(gray))
+    if std_dev < std_threshold:
+        return True, f"std={std_dev:.1f} < {std_threshold}"
+
+    # 4. 黑屏检测（遮挡/断电）
+    # 在 NumPy 中直接计算，small_frame 已经足够小，计算极快
+    black_mask = np.all(small_frame <= 30, axis=2)
+    black_ratio = float(np.sum(black_mask)) / (check_size[0] * check_size[1])
+
+    if black_ratio > black_ratio_threshold:
+        return True, f"black_ratio={black_ratio:.2%} > {black_ratio_threshold:.0%}"
+
+    return False, None
+
+
 # 配置信息（保持不变）
 headers = {
     "Client-Id": "cycm_jg_pc_110107",
-    "Authorization": "eyJ0eXAiOiJKV1QiLCJhbGciOiJSUzI1NiJ9.eyJ1c2VySWQiOiJ2dkoxamU4VTJiT0wyQXExUTloTXRHS2IvNzFxcUNKbkczVElqNTRYbEZzak9pTEcwdWpWVmRpVTd3c25DYWhrdXBOVk5nWGhiaGs3dTJiTlpxajhWSEdWRjY5UW5HWXZXWVBoWEdqSHZFNko3bTFqenJJOC9CTzg1WVhrSnhSNkY4UU5VQU5UY0xEeVFkOXRZUUcrd1NiNzBBZ0JlS3Y0TEpuTXVUUEJsQkNIbFNuU0xiOUpBTWUyU1BaVEV0NXV0aGIxUEY1YWRjZXFlekJZajRFNU5GWTNEd20rQUF2WTREOHFqZ2ZhUjJXVFJGVXdOY2ZnQnk0Q0RHNUd2Mng2WDJPN2xQVTdpYUlzZHFvVEU4RnVLRy9HSkhyWXNkWEg3OVo0WlVUdlVKanRKa2xnMGk3c2xtWEFNaTV2NGRPSUExUG9HM1cyL0pkNXJISytxR0xETXc9PSIsImlhdCI6MTc3NjM0NDMxMiwiZXhwIjoyNDQ4MjI2NDMxMn0.NN20PvRRnTUwXAckBd9PMlipkXtx19kCBx95UchPjz2ivqYTznre6gGnqPkS-Rp2AkDUkArEamU-1SIItsVvvXbledeciFmK_SVbsYGTgb2-zwLn6-05fbAuxpMQz-yV6DQKRd2BYwFRaeG9m3_7xXqDpmbvu6lkIPItT20bTPzIAqvjIa2SSgrJcuvxZkLMDdE11m_V8AeJpSqFWJpMXaySVz4GuIQl2gphvMJv0vwBhssLYsORbQBTAY8p8qE-_fFDHuTB4W-Lxxkj2iaYpRSGm5ym5IGMo7M-gf5VyzI68kWcnwauO8SdvffS-mpu0ex_8w7uP_ogPKgXQMPMJA"
+    "Authorization": "eyJ0eXAiOiJKV1QiLCJhbGciOiJSUzI1NiJ9.eyJ1c2VySWQiOiJ2dkoxamU4VTJiT0wyQXExUTloTXRHS2IvNzFxcUNKbkczVElqNTRYbEZzak9pTEcwdWpWVmRpVTd3c25DYWhrdXBOVk5nWGhiaGs3dTJiTlpxajhWSEdWRjY5UW5HWXZXWVBoWEdqSHZFNko3bTFqenJJOC9CTzg1WVhrSnhSNkY4UU5VQU5UY0xEeVFkOXRZUUcrd1NiNzBBZ0JlS3Y0TEpuTXVUUEJsQkNIbFNuU0xiOUpBTWUyU1BaVEV0NXV0aGIxUEY1YWRjZXFlekJZajRFNU5GWTNEd20rQUF2WTREOHFqZ2ZhUjJXVFJGVXdOY2ZnQnk0Q0RHNUd2Mng2WDJPN2xQVTdpYUlzZHFvVEU4RnVLRy9HSkhyWXNkWEg3OVo0WlVUdlVKanRKa2xnMGk3c2xtWEFNaTV2NGRPSUExUG9HM1cyL0pkNXJISytxR0xETXc9PSIsImlhdCI6MTc3NjM0NDMxMiwiZXhwIjoyNDQ4MjI2NDMxMn0.NN20PvRRnTUwXAckBd9PMlipkXtx19kCBx95UchPjz2ivqYTznre6gGnqPkS-Rp2AkDUkArEamU-1SIItsVvvXbledeciFmK_SVbsYGTgb2-zwLn6-05fbAuxpMQz-yV6DQKRd2BYwFRaeG9m3_7xXqDpmbvu6lkIPItT20bTPzIAqvjIa2SSgrJcuvxZkLMDdE11m_V8AeJpSqFWJpMXaySVz4GuIQl2gphvMJv0vwBhssLYsORbQBTAY8p8qE-_fFDHuTB4W-Lxxkj2iaYpRSGm5ym5IGMo7M-gf5VyzI68kWcnwauO8SdvffS-mpu0ex_8w7uP_ogPKgXQMPMJA",
 }
 
 
@@ -140,20 +192,20 @@ class DetectionSystem:
         """初始化检测系统，设置环境相关配置"""
         # 根据传入的environment参数设置host
         if environment == "test":
-            self.host = "https://api5.jyfwyun.com/"
+            self.host = "https://cycm.jyfwyun.com/apiv3/"
             print("使用测试环境host:", self.host)
         else:
-            self.host = "ttps://cycm.jyfwyun.com/apiv3/"
+            self.host = "https://cycm.jyfwyun.com/apiv3/"
             print("使用生产环境host:", self.host)
 
         # 设置数据库连接参数
         if environment == "test":
             db_config = {
-                "host": "192.168.1.246",
-                "port": 3306,
-                "user": "root",
-                "password": "OnPCz12u^@~*ecfmZvR",
-                "db": "cycm_server",
+                "host": "36.112.39.92",
+                "port": 61851,
+                "user": "pgy-cy",
+                "password": "JVOjAiMBAUXOlVV6",
+                "db": "pgy_server",
             }
             print("使用测试环境数据库:", db_config["host"])
         else:
@@ -257,7 +309,7 @@ class DetectionSystem:
         cs = conn.cursor()
 
         # 查询符合条件的摄像头
-        sql = "SELECT id,shop_id,detection_models FROM pgy_server.pgy_shop_camera where enable = 1 and length(shop_id) > 1"
+        sql = "SELECT id,shop_id,detection_models,camera_name,device_serial FROM pgy_server.pgy_shop_camera where enable = 1 and length(shop_id) > 1"
         cs.execute(sql)
         camera_list = cs.fetchall()
         print(f"[{_ts()}] [CAPTURE] 开始截图任务，共 {len(camera_list)} 个启用摄像头")
@@ -270,44 +322,63 @@ class DetectionSystem:
             camera_id = camera[0]
             shop_id = camera[1]
             detection_models = camera[2]
+            device_serial = camera[4]
+            camera_name = camera[3] or camera_id  # 摄像头名称，无则用 ID 代替
             try:
                 rtsp = None
                 # 调用接口获取RTSP直播地址
                 response = requests.post(
-                    self.host + "/cycm-cloud/cross/camera/getVideoUrl?id=" + camera_id, headers=headers
+                    self.host + "cycm-cloud/cross/camera/getVideoUrl?id=" + camera_id, headers=headers
                 )
                 if response.status_code == 200 and response.json()["code"] == 0:
                     result = response.json()["result"]
+                    result["rtsp"] = (
+                        f"rtsp://wvp2.theling.team:8554/rtp/{device_serial}?originTypeStr=rtp_push&videoCodec=H265"
+                    )
                     # 优先使用RTSP流，如果没有则使用HLS流
                     if "rtsp" in result and result["rtsp"]:
                         rtsp = result["rtsp"]
-                        print(f"[{_ts()}] [CAPTURE] 摄像头 {camera_id} 获取视频流成功 (RTSP)")
+                        print(f"[{_ts()}] [CAPTURE] 摄像头 [{camera_name}](shop={shop_id}) 获取视频流成功 (RTSP)")
                     elif "hls" in result and result["hls"]:
                         rtsp = result["hls"]
-                        print(f"[{_ts()}] [CAPTURE] 摄像头 {camera_id} 获取视频流成功 (HLS)")
+                        print(f"[{_ts()}] [CAPTURE] 摄像头 [{camera_name}](shop={shop_id}) 获取视频流成功 (HLS)")
                     else:
-                        print(f"[{_ts()}] [CAPTURE FAIL] 摄像头 {camera_id} 接口未返回可用视频流 (无RTSP/HLS)")
+                        print(
+                            f"[{_ts()}] [CAPTURE FAIL] 摄像头 [{camera_name}](shop={shop_id}) 接口未返回可用视频流 (无RTSP/HLS)"
+                        )
                         fail_count += 1
                         return
                 else:
                     print(
-                        f"[{_ts()}] [CAPTURE FAIL] 摄像头 {camera_id} 获取视频流失败: HTTP状态={response.status_code}"
+                        f"[{_ts()}] [CAPTURE FAIL] 摄像头 [{camera_name}](shop={shop_id}) 获取视频流失败: HTTP状态={response.status_code}"
                     )
                     fail_count += 1
                     return
 
                 if rtsp is None:
-                    print(f"[{_ts()}] [CAPTURE FAIL] 摄像头 {camera_id} 视频流地址为空")
+                    print(f"[{_ts()}] [CAPTURE FAIL] 摄像头 [{camera_name}](shop={shop_id}) 视频流地址为空")
                     fail_count += 1
                     return
                 # 截图
                 frame = capture_frame_robust(rtsp)
                 if frame is not None:
+                    invalid, reason = is_invalid_frame(frame)
+                    if invalid:
+                        print(
+                            f"[{_ts()}] [CAPTURE SKIP] 摄像头 [{camera_name}](shop={shop_id}) 无效帧，已跳过: {reason}"
+                        )
+                        fail_count += 1
+                        return
                     file_name = str(int(time.time())) + str(random.randint(0, 50)) + ".jpg"
-                    # 在img下创建年月日目录
-                    img_dir = "./img/" + time.strftime("%Y%m%d", time.localtime()) + "/"
+                    # device_serial 结构：shopid_cameraid
+                    if "_" in device_serial:
+                        shop_id_from_serial, camera_id_from_serial = device_serial.split("_", 1)
+                    else:
+                        shop_id_from_serial, camera_id_from_serial = shop_id, device_serial
+                    # 在img下创建年月日/店铺ID目录
+                    img_dir = os.path.join("./img", time.strftime("%Y%m%d", time.localtime()), shop_id_from_serial)
                     os.makedirs(img_dir, exist_ok=True)
-                    file_path = img_dir + file_name
+                    file_path = os.path.join(img_dir, file_name)
                     cv2.imwrite(file_path, frame)
                     h, w = frame.shape[:2]
                     # 存储截图信息到全局对象中（不再需要线程锁）
@@ -315,16 +386,23 @@ class DetectionSystem:
                         "file_path": file_path,
                         "camera_id": camera_id,
                         "shop_id": shop_id,
+                        "camera_name": camera_name,
                         "detection_models": detection_models,
                         "original_frame": frame,  # 保留内存中的原始帧，供检测方法直接使用
                     }
                     success_count += 1
-                    print(f"[{_ts()}] [CAPTURE OK] 摄像头 {camera_id} 截图成功: {file_path} ({w}x{h})")
+                    print(
+                        f"[{_ts()}] [CAPTURE OK] 摄像头 [{camera_name}](shop={shop_id}) 截图成功: {file_path} ({w}x{h})"
+                    )
                 else:
-                    print(f"[{_ts()}] [CAPTURE FAIL] 摄像头 {camera_id} 截图失败 (capture_frame_robust 返回 None)")
+                    print(
+                        f"[{_ts()}] [CAPTURE FAIL] 摄像头 [{camera_name}](shop={shop_id}) 截图失败 (capture_frame_robust 返回 None)"
+                    )
                     fail_count += 1
             except Exception as e:
-                print(f"[{_ts()}] [CAPTURE ERROR] 摄像头 {camera_id} 截图异常: {type(e).__name__} - {e}")
+                print(
+                    f"[{_ts()}] [CAPTURE ERROR] 摄像头 [{camera_name}](shop={shop_id}) 截图异常: {type(e).__name__} - {e}"
+                )
                 fail_count += 1
 
         # 同步执行截图操作
@@ -340,10 +418,12 @@ class DetectionSystem:
         """
         对单张截图执行新的二级（检测+分类）流程，并复用原有的结果上报逻辑。
         """
-        print(f"[{_ts()}] [2STAGE] 开始对摄像头 {camera_id} 进行二级检测 [{group_name}]")
+        camera_name = frame_data.get("camera_name", camera_id)
+        shop_id = frame_data.get("shop_id", "?")
+        print(f"[{_ts()}] [2STAGE] 摄像头 [{camera_name}](shop={shop_id}) 开始二级检测 [{group_name}]")
         original_image = frame_data["original_frame"]  # 直接使用内存中的图像，避免重复读取
         if original_image is None:
-            print(f"[{_ts()}] [2STAGE FAIL] 摄像头 {camera_id} 无法获取原始图像帧")
+            print(f"[{_ts()}] [2STAGE FAIL] 摄像头 [{camera_name}](shop={shop_id}) 无法获取原始图像帧")
             return
 
         # 遍历所有配置好的二级模型组
@@ -401,7 +481,8 @@ class DetectionSystem:
 
                     time_str = time.strftime("%Y%m%d%H%M%S", time.localtime())
                     file_name = f"{time_str}_{config['detection_type']}_{random.randint(0, 999)}.png"
-                    result_dir = "./result/" + time.strftime("%Y%m%d", time.localtime()) + "/"
+                    # 保存路径加上shop_id
+                    result_dir = os.path.join("./result", time.strftime("%Y%m%d", time.localtime()), str(shop_id))
                     os.makedirs(result_dir, exist_ok=True)
                     result_file_path = os.path.join(result_dir, file_name)
                     cv2.imwrite(result_file_path, result_image)
@@ -437,10 +518,14 @@ class DetectionSystem:
                         file_relevance_resource_url = f"{self.host}/cloud-service/api/file/upload/fileRelevanceResource"
                         requests.post(file_relevance_resource_url, json=resource_data, headers=headers)
 
-                    print(f"[{_ts()}] [2STAGE DONE] 违规记录已保存: {label_text}")
+                    print(
+                        f"[{_ts()}] [2STAGE DONE] 摄像头 [{camera_name}](shop={shop_id}) 违规记录已保存: {label_text}"
+                    )
 
                 except Exception as e:
-                    print(f"[{_ts()}] [2STAGE ERROR] 摄像头 {camera_id} 处理二级检测结果异常: {type(e).__name__} - {e}")
+                    print(
+                        f"[{_ts()}] [2STAGE ERROR] 摄像头 [{camera_name}](shop={shop_id}) 处理二级检测结果异常: {type(e).__name__} - {e}"
+                    )
 
     # --- 赤膊检测方法 ---
     def process_bareness_detection(self, frame_data, camera_id, conf):
@@ -452,10 +537,12 @@ class DetectionSystem:
           4. 违规则绘图上报
         当前为单帧版，后续可替换为多帧投票版以降低误报率。
         """
-        print(f"[{_ts()}] [BARENESS] 开始对摄像头 {camera_id} 进行赤膊检测")
+        camera_name = frame_data.get("camera_name", camera_id)
+        shop_id = frame_data.get("shop_id", "?")
+        print(f"[{_ts()}] [BARENESS] 摄像头 [{camera_name}](shop={shop_id}) 开始赤膊检测")
         original_image = frame_data.get("original_frame")
         if original_image is None:
-            print(f"[{_ts()}] [BARENESS FAIL] 摄像头 {camera_id} 无法获取原始图像帧")
+            print(f"[{_ts()}] [BARENESS FAIL] 摄像头 [{camera_name}](shop={shop_id}) 无法获取原始图像帧")
             return
 
         # 复用工作服检测组的人体检测器（person_detection_with_tuning_v1.1.pt）
@@ -464,7 +551,7 @@ class DetectionSystem:
 
         detections = body_detector(original_image, conf=BARENESS_BODY_CONF, verbose=False)
         person_count = len(detections[0].boxes) if detections[0].boxes is not None else 0
-        print(f"[{_ts()}] [BARENESS] 摄像头 {camera_id} 人体检测完成，检测到 {person_count} 个人体")
+        print(f"[{_ts()}] [BARENESS] 摄像头 [{camera_name}](shop={shop_id}) 人体检测完成，检测到 {person_count} 个人体")
         if person_count == 0:
             return
         for box in detections[0].boxes:
@@ -484,7 +571,7 @@ class DetectionSystem:
             if not is_violation:
                 continue
 
-            print(f"[{_ts()}] [VIOLATION] ★ 发现赤膊违规 摄像头={camera_id} conf={score:.2f}")
+            print(f"[{_ts()}] [VIOLATION] ★ 发现赤膊违规 摄像头=[{camera_name}](shop={shop_id}) conf={score:.2f}")
             try:
                 x1, y1, x2, y2 = coords
                 label_text = f"bareness: {score:.2f}"
@@ -508,7 +595,7 @@ class DetectionSystem:
                 cos_key = file_data[0]["cosKey"]
                 zlFileId = file_data[0]["zlFileId"]
                 upload_to_cos(result_file_path, cos_key)
-                print(f"[{_ts()}] [UPLOAD OK] 摄像头 {camera_id} 赤膊违规图片上传成功: {file_name}")
+                print(f"[{_ts()}] [UPLOAD OK] 摄像头 [{camera_name}](shop={shop_id}) 赤膊违规图片上传成功: {file_name}")
 
                 detection_result_url = f"{self.host}/cycm-cloud/api/detectionResult/insert"
                 detection_result = {
@@ -530,9 +617,11 @@ class DetectionSystem:
                         headers=headers,
                     )
 
-                print(f"[{_ts()}] [BARENESS DONE] 赤膊违规已上报: {label_text}")
+                print(f"[{_ts()}] [BARENESS DONE] 摄像头 [{camera_name}](shop={shop_id}) 赤膊违规已上报: {label_text}")
             except Exception as e:
-                print(f"[{_ts()}] [BARENESS ERROR] 摄像头 {camera_id} 处理赤膊结果异常: {type(e).__name__} - {e}")
+                print(
+                    f"[{_ts()}] [BARENESS ERROR] 摄像头 [{camera_name}](shop={shop_id}) 处理赤膊结果异常: {type(e).__name__} - {e}"
+                )
 
     # --- 人离火检测方法 ---
     def process_stove_detection(self, frame_data, camera_id, conf):
@@ -544,10 +633,12 @@ class DetectionSystem:
           4. 加热且无人看管则上报
         当前为单帧版，不含漏桶积分和持久化追踪，后续可升级为多帧状态版。
         """
-        print(f"[{_ts()}] [STOVE] 开始对摄像头 {camera_id} 进行人离火检测")
+        camera_name = frame_data.get("camera_name", camera_id)
+        shop_id = frame_data.get("shop_id", "?")
+        print(f"[{_ts()}] [STOVE] 摄像头 [{camera_name}](shop={shop_id}) 开始人离火检测")
         original_image = frame_data.get("original_frame")
         if original_image is None:
-            print(f"[{_ts()}] [STOVE FAIL] 摄像头 {camera_id} 无法获取原始图像帧")
+            print(f"[{_ts()}] [STOVE FAIL] 摄像头 [{camera_name}](shop={shop_id}) 无法获取原始图像帧")
             return
 
         img_h, img_w = original_image.shape[:2]
@@ -561,19 +652,21 @@ class DetectionSystem:
         # 1. 检测锅具
         pot_results = pot_model(original_image, conf=conf, verbose=False)[0]
         if pot_results.boxes is None or len(pot_results.boxes) == 0:
-            print(f"[{_ts()}] [STOVE] 摄像头 {camera_id} 未检测到锅具")
+            print(f"[{_ts()}] [STOVE] 摄像头 [{camera_name}](shop={shop_id}) 未检测到锅具")
             return
-        print(f"[{_ts()}] [STOVE] 摄像头 {camera_id} 检测到 {len(pot_results.boxes)} 口锅具")
+        print(f"[{_ts()}] [STOVE] 摄像头 [{camera_name}](shop={shop_id}) 检测到 {len(pot_results.boxes)} 口锅具")
 
         # 2. 全图蒸汽检测（作为兜底证据）
         gas_results = gas_model(original_image, conf=0.35, verbose=False)[0]
         gas_bboxes = gas_results.boxes.xyxy.cpu().numpy() if gas_results.boxes is not None else []
-        print(f"[{_ts()}] [STOVE] 摄像头 {camera_id} 全图蒸汽/气体检测完成，检测到 {len(gas_bboxes)} 处")
+        print(
+            f"[{_ts()}] [STOVE] 摄像头 [{camera_name}](shop={shop_id}) 全图蒸汽/气体检测完成，检测到 {len(gas_bboxes)} 处"
+        )
 
         # 3. 姿态检测（一次性对全图，供所有锅具复用）
         pose_results = pose_model(original_image, conf=0.5, verbose=False)[0]
         pose_count = len(pose_results.keypoints.xy) if pose_results.keypoints is not None else 0
-        print(f"[{_ts()}] [STOVE] 摄像头 {camera_id} 姿态检测完成，检测到 {pose_count} 个人体")
+        print(f"[{_ts()}] [STOVE] 摄像头 [{camera_name}](shop={shop_id}) 姿态检测完成，检测到 {pose_count} 个人体")
 
         for box in pot_results.boxes:
             pot_bbox = box.xyxy[0].cpu().numpy()
@@ -601,7 +694,7 @@ class DetectionSystem:
 
             is_active = has_flame or has_boil or has_steam or has_gas
             print(
-                f"[{_ts()}] [STOVE] 摄像头 {camera_id} 锅具 [{x1},{y1},{x2},{y2}]: "
+                f"[{_ts()}] [STOVE] 摄像头 [{camera_name}](shop={shop_id}) 锅具 [{x1},{y1},{x2},{y2}]: "
                 f"flame={has_flame} boil={has_boil} steam={has_steam} gas={has_gas} active={is_active}"
             )
 
@@ -610,13 +703,17 @@ class DetectionSystem:
 
             # 5. 判断是否有人看管
             is_attended = check_pot_attended_by_pose(pot_bbox, pose_results)
-            print(f"[{_ts()}] [STOVE] 摄像头 {camera_id} 锅具 [{x1},{y1},{x2},{y2}] 看管状态: attended={is_attended}")
+            print(
+                f"[{_ts()}] [STOVE] 摄像头 [{camera_name}](shop={shop_id}) 锅具 [{x1},{y1},{x2},{y2}] 看管状态: attended={is_attended}"
+            )
 
             if is_attended:
                 continue
 
             # 6. 上报违规
-            print(f"[{_ts()}] [VIOLATION] ★ 发现人离火违规! 摄像头={camera_id} 锅具=[{x1},{y1},{x2},{y2}]")
+            print(
+                f"[{_ts()}] [VIOLATION] ★ 发现人离火违规! 摄像头=[{camera_name}](shop={shop_id}) 锅具=[{x1},{y1},{x2},{y2}]"
+            )
             try:
                 active_flags = []
                 if has_flame:
@@ -668,9 +765,11 @@ class DetectionSystem:
                         headers=headers,
                     )
 
-                print(f"[{_ts()}] [STOVE DONE] 人离火违规已上报: {label_text}")
+                print(f"[{_ts()}] [STOVE DONE] 摄像头 [{camera_name}](shop={shop_id}) 人离火违规已上报: {label_text}")
             except Exception as e:
-                print(f"[{_ts()}] [STOVE ERROR] 摄像头 {camera_id} 处理人离火结果异常: {type(e).__name__} - {e}")
+                print(
+                    f"[{_ts()}] [STOVE ERROR] 摄像头 [{camera_name}](shop={shop_id}) 处理人离火结果异常: {type(e).__name__} - {e}"
+                )
 
     # 方法二：对截图数据进行识别和结果处理
     def process_detection_on_captured_frames(self, rule):
@@ -685,7 +784,7 @@ class DetectionSystem:
             # 仅在处理第一个规则时打印，避免重复信息
             if rule["id"] == 1:
                 print("没有需要处理的截图数据")
-            return
+                return
 
             # 仅在处理第一个规则时打印，避免重复信息
         if rule["id"] == 1:
@@ -695,14 +794,15 @@ class DetectionSystem:
             try:
                 file_path = frame_data["file_path"]
                 shop_id = frame_data["shop_id"]
+                camera_name = frame_data.get("camera_name", camera_id)
                 detection_models = frame_data["detection_models"]
 
                 model = rule["model"]
                 classes = rule["classes"]
                 conf = rule["conf"]
-                print(f"[{_ts()}] [DETECT] 规则 '{rule['label']}' - 处理摄像头 {camera_id} (shop={shop_id})")
+                print(f"[{_ts()}] [DETECT] 规则 '{rule['label']}' - 摄像头 [{camera_name}](shop={shop_id})")
                 if not str(detection_models).__contains__(model):
-                    print(f"[{_ts()}] [SKIP] 摄像头 {camera_id} 未配置模型 '{model}'，跳过")
+                    print(f"[{_ts()}] [SKIP] 摄像头 [{camera_name}](shop={shop_id}) 未配置模型 '{model}'，跳过")
                     continue
 
                 # --- 对截图执行需要二级检测的类别：垃圾桶未盖盖 ---
@@ -758,7 +858,7 @@ class DetectionSystem:
                                 result_file_path = "./result/" + time.strftime("%Y%m%d", time.localtime()) + "/"
                                 os.makedirs(result_file_path, exist_ok=True)
                                 # 为每个label保存一张单独的图片
-                                save_path = result_file_path + file_name
+                                save_path = os.path.join(result_file_path, file_name)
                                 result.save(save_path)
                                 detected_labels[detected_label] = {
                                     "conf": conf_value,
@@ -795,7 +895,9 @@ class DetectionSystem:
                         zlFileId = file_data[0]["zlFileId"]
                         upload_to_cos(result_file_path, cos_key)
                         print(
-                            f"[{_ts()}] [UPLOAD OK] 摄像头 {camera_id} 图片上传成功: {result_file_name} label={detected_label} conf={conf_value:.2f}"
+                            print(
+                                f"[{_ts()}] [UPLOAD OK] 摄像头 [{camera_name}](shop={shop_id}) 图片上传成功: {result_file_name} label={detected_label} conf={conf_value:.2f}"
+                            )
                         )
 
                         # 创建检测记录
@@ -818,15 +920,17 @@ class DetectionSystem:
                             )
                             requests.post(file_relevance_resource_url, json=resource_data, headers=headers)
 
-                        print(f"[{_ts()}] [DETECT DONE] 检测记录已保存: {detected_label} conf={conf_value:.2f}")
+                        print(
+                            f"[{_ts()}] [DETECT DONE] 摄像头 [{camera_name}](shop={shop_id}) 检测记录已保存: {detected_label} conf={conf_value:.2f}"
+                        )
 
                     except Exception as e:
                         print(
-                            f"[{_ts()}] [DETECT ERROR] 摄像头 {camera_id} 处理检测结果 '{detected_label}' 异常: {type(e).__name__} - {e}"
+                            f"[{_ts()}] [DETECT ERROR] 摄像头 [{camera_name}](shop={shop_id}) 处理检测结果 '{detected_label}' 异常: {type(e).__name__} - {e}"
                         )
 
             except Exception as e:
-                print(f"[{_ts()}] [ERROR] 摄像头 {camera_id} 处理异常: {type(e).__name__} - {e}")
+                print(f"[{_ts()}] [ERROR] 摄像头 [{camera_name}](shop={shop_id}) 处理异常: {type(e).__name__} - {e}")
 
         print(f"[{_ts()}] [DETECT END] 规则 '{rule['label']}' 所有摄像头检测完成")
 
@@ -861,7 +965,7 @@ class DetectionSystem:
             {"id": 1, "label": "未戴口罩", "model": "without_mask", "conf": 0.5, "classes": [6]},
             {"id": 2, "label": "未戴厨师帽", "model": "no_hat", "conf": 0.5, "classes": [3]},
             {"id": 8, "label": "乱堆乱放", "model": "garbage", "conf": 0.1, "classes": [10]},
-            {"id": 9, "label": "玩手机", "model": "phone", "conf": 0.1, "classes": [0]},
+            {"id": 9, "label": "玩手机", "model": "phone", "conf": 0.2, "classes": [0]},
             {"id": 10, "label": "有害生物", "model": "rat", "conf": 0.8, "classes": [4]},
             {"id": 3, "label": "吸烟", "model": "smoke", "conf": 0.5, "classes": [0]},
             {"id": 16, "label": "未穿工作服", "model": "without_work_clothes", "conf": 0.4, "classes": [0]},
@@ -881,31 +985,33 @@ class DetectionSystem:
                 rule_ids.append(rule["id"])
         print(f"[{_ts()}] [DB] 摄像头已配置的规则 ID: {rule_ids} (共 {len(rule_ids)} 条)")
         # 查询需要执行的规则
-        sql = "SELECT r.id,c.threshold_min FROM work_iot_warn_rule r INNER JOIN work_ai_model_config c on c.id=r.ai_mode_config_id WHERE r.enabled = 1 AND (c.last_execution_time IS NULL OR NOW() >= DATE_ADD(c.last_execution_time, INTERVAL c.cycle SECOND))"
-        if len(rule_ids) > 0:
-            sql += f" AND r.id IN ({','.join([str(id) for id in rule_ids])})"
+        # sql = "SELECT r.id,c.threshold_min FROM work_iot_warn_rule r INNER JOIN work_ai_model_config c on c.id=r.ai_mode_config_id WHERE r.enabled = 1 AND (c.last_execution_time IS NULL OR NOW() >= DATE_ADD(c.last_execution_time, INTERVAL c.cycle SECOND))"
+        # if len(rule_ids) > 0:
+        #     sql += f" AND r.id IN ({','.join([str(id) for id in rule_ids])})"
         conn = self.pool.connection()
         cs = conn.cursor()
-        cs.execute(sql)
-        data = cs.fetchall()
-        if not data or len(data) == 0:
-            print(f"[{_ts()}] [WARN] 无待执行规则，跳过此轮检测")
-            return
-        print(f"[{_ts()}] [DB] 查询到 {len(data)} 条待执行规则: {[d[0] for d in data]}")
+        # cs.execute(sql)
+        # data = cs.fetchall()
+        # if not data or len(data) == 0:
+        #     print(f"[{_ts()}] [WARN] 无待执行规则，跳过此轮检测")
+        #     time.sleep(10)
+        #     return
+        # print(f"[{_ts()}] [DB] 查询到 {len(data)} 条待执行规则: {[d[0] for d in data]}")
         # 直接调用重构后的方法，不使用线程
         self.capture_frames_from_cameras()
         # 截完图之后再次查询一遍，确保数据是最新的
 
-        cs = conn.cursor()
-        cs.execute(sql)
-        data = cs.fetchall()
-        if not data or len(data) == 0:
-            print(f"[{_ts()}] [WARN] 截图完成后规则已全部过期，跳过此轮")
-            return
-        rule_id_map = {d[0]: d[1] for d in data}
+        # cs = conn.cursor()
+        # cs.execute(sql)
+        # data = cs.fetchall()
+        # if not data or len(data) == 0:
+        #     print(f"[{_ts()}] [WARN] 截图完成后规则已全部过期，跳过此轮")
+        #     return
+        # rule_id_map = {d[0]: d[1] for d in data}
 
         # 循环逐个处理规则
         processed_count = 0
+        rule_id_map = {d["id"]: d["conf"] for d in rule_list}
         for rule in rule_list:
             if rule["id"] not in rule_id_map.keys():
                 print(f"[{_ts()}] [SKIP] 规则 '{rule['label']}' (ID={rule['id']}) 无需执行，跳过")
@@ -928,7 +1034,6 @@ class DetectionSystem:
         total_elapsed = time.time() - t_run_start
         print(f"[{_ts()}] [RUN END] 本轮任务结束，共处理 {processed_count} 条规则，总耗时 {total_elapsed:.2f}s")
         print(f"[{_ts()}] [RUN END] {'=' * 50}\n")
-        time.sleep(5)
 
 
 def main(environment=None):
@@ -943,10 +1048,20 @@ if __name__ == "__main__":
 
     # 2. 只有检测逻辑在无限循环中运行
     while True:
+        t_start = time.time()
         try:
             detection_system.run()
         except Exception as e:
             # 加上全局异常捕获，防止因为偶尔的网络抖动导致整个脚本崩溃退出
             print(
-                f"[{time.strftime('%Y-%m-%d %H:%M:%S', time.localtime())}] [CRITICAL] 主循环发生致命异常: {type(e).__name__} - {e}")
-            time.sleep(10)
+                f"[{time.strftime('%Y-%m-%d %H:%M:%S', time.localtime())}] [CRITICAL] 主循环发生致命异常: {type(e).__name__} - {e}"
+            )
+        interval = get_detection_interval()
+        elapsed = time.time() - t_start
+        sleep_secs = max(0.0, interval - elapsed)
+        next_run = time.strftime("%H:%M:%S", time.localtime(time.time() + sleep_secs))
+        print(
+            f"[{_ts()}] [SCHEDULER] 当前间隔={interval // 60}分钟 | 本轮耗时={elapsed:.1f}s | "
+            f"等待={sleep_secs:.1f}s | 下次执行时间={next_run}"
+        )
+        time.sleep(sleep_secs)
